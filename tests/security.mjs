@@ -1,0 +1,50 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+// Deliberately fixed to the local development server; never tests production.
+const base='http://127.0.0.1:5173', results=[];
+async function check(name,fn){try{await fn();results.push({name,passed:true});console.log('PASS '+name);}catch(e){results.push({name,passed:false});console.error('FAIL '+name+': '+e.message);}}
+function client(){return {cookie:'',async req(path,body,extra={}){const r=await fetch(base+path,{method:body===undefined?'GET':'POST',headers:{Origin:base,'Content-Type':'application/json',Cookie:this.cookie,...extra},body:body===undefined?undefined:JSON.stringify(body)});const raw=await r.text();let data;try{data=JSON.parse(raw);}catch{data={error:raw};}const c=r.headers.get('set-cookie');if(c)this.cookie=c.split(';')[0];return {status:r.status,data,headers:r.headers};}};}
+const a=client(),t=client(),o=client(),stamp=Date.now(),password='Security-Test-2026!';
+const register=async(c,label)=>{const r=await c.req('/api/auth',{action:'register',email:`security-${label}-${stamp}@example.test`,name:label,password});assert.equal(r.status,200,JSON.stringify(r.data));return r.data;};
+const admin=await register(a,'coord'),teacher=await register(t,'teacher');await register(o,'outside');
+for(const route of ['/api/data','/api/team','/api/files?id=unknown'])await check('Anonymous denied '+route,async()=>assert.equal((await client().req(route)).status,401));
+await check('Forged session denied',async()=>assert.equal((await client().req('/api/data',undefined,{Cookie:'cf_session='+'a'.repeat(64)})).status,401));
+await check('Cookie is HttpOnly and SameSite',async()=>{const r=await a.req('/api/auth',{action:'login',email:admin.user.email,password});assert.match(r.headers.get('set-cookie'),/HttpOnly/);assert.match(r.headers.get('set-cookie'),/SameSite=Lax/);assert.equal(r.headers.get('cache-control'),'no-store');});
+for(const origin of ['', 'https://attacker.invalid'])await check('Cross-origin mutation denied '+(origin||'missing'),async()=>assert.ok([400,403].includes((await a.req('/api/team',{action:'invite',email:'nobody@example.test'},{Origin:origin})).status)));
+const inv=await a.req('/api/team',{action:'invite',email:teacher.user.email}),code=new URL(inv.data.url).searchParams.get('invite');
+await check('Invitation bound to email',async()=>assert.equal((await o.req('/api/team',{action:'join',code})).status,400));
+assert.equal((await t.req('/api/team',{action:'join',code})).status,200);
+await check('Invitation cannot be reused',async()=>assert.equal((await t.req('/api/team',{action:'join',code})).status,400));
+await check('Teacher cannot manage staff',async()=>assert.equal((await t.req('/api/team',{action:'status',userId:teacher.user.id,active:true,role:'coordinator'})).status,403));
+const s=crypto.randomUUID();
+const cl=async name=>(await a.req('/api/data',{kind:'class',data:{name,students:[{id:s,name:'Synthetic Student',number:'1'}]}})).data.id;
+const c1=await cl('Security A'),c2=await cl('Security B');
+await check('Unassigned teacher sees no records',async()=>assert.equal((await t.req('/api/data')).data.rows.length,0));
+await a.req('/api/team',{action:'assign',userId:teacher.user.id,classIds:[c1]});
+const ex=await a.req('/api/data',{kind:'exam',data:{title:'Security exam',subject:'Test',date:'2026-10-27',classIds:[c1],questions:[{id:'q1',type:'choice',key:'A',points:1,rubric:''}]}});assert.equal(ex.status,200);
+await check('Other organization sees no records',async()=>assert.equal((await o.req('/api/data')).data.rows.length,0));
+await check('Teacher cannot forge coordinator role',async()=>assert.equal((await t.req('/api/data',{kind:'class',owner:admin.user.id,role:'coordinator',data:{name:'Forged',students:[]}})).status,403));
+await check('Cannot assign foreign teacher',async()=>assert.equal((await o.req('/api/team',{action:'assign',userId:teacher.user.id,classIds:[c1]})).status,400));
+async function upload(c,classId,content,type='image/png'){const f=new FormData();f.set('examId',ex.data.id);f.set('classId',classId);f.set('file',new File([content],'security.png',{type}));const r=await fetch(base+'/api/files',{method:'POST',headers:{Cookie:c.cookie,Origin:base},body:f});return {status:r.status,data:await r.json()};}
+const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l1cAAAAASUVORK5CYII=','base64');
+await check('Forged file MIME rejected',async()=>assert.equal((await upload(t,c1,'<script>alert(1)</script>')).status,400));
+await check('Teacher cannot upload to unassigned class',async()=>assert.equal((await upload(t,c2,png)).status,403));
+await check('Upload class must belong to exam',async()=>assert.equal((await upload(a,c2,png)).status,400));
+const file=await upload(t,c1,png);assert.equal(file.status,200);
+await check('Private file inaccessible outside organization',async()=>assert.equal((await o.req('/api/files?id='+file.data.id)).status,404));
+await a.req('/api/team',{action:'assign',userId:teacher.user.id,classIds:[]});
+await check('Removed assignment immediately blocks existing file',async()=>assert.equal((await t.req('/api/files?id='+file.data.id)).status,403));
+const oldCookie=t.cookie;
+await a.req('/api/team',{action:'status',userId:teacher.user.id,active:false});
+await check('Suspension blocks existing session',async()=>assert.equal((await t.req('/api/data')).status,401));
+await a.req('/api/team',{action:'status',userId:teacher.user.id,active:true});
+await check('Suspension permanently revokes previous session',async()=>assert.equal((await client().req('/api/data',undefined,{Cookie:oldCookie})).status,401));
+await a.req('/api/team',{action:'status',userId:teacher.user.id,active:false});
+await check('Suspended recovery denied',async()=>assert.equal((await t.req('/api/auth',{action:'recover',email:teacher.user.email,password,recovery:teacher.recoveryCode})).status,400));
+await a.req('/api/team',{action:'status',userId:teacher.user.id,active:true});
+await check('Reactivation does not resurrect old session',async()=>assert.equal((await client().req('/api/data',undefined,{Cookie:oldCookie})).status,401));
+await check('Denied recovery did not consume recovery code',async()=>assert.equal((await t.req('/api/auth',{action:'recover',email:teacher.user.email,password,recovery:teacher.recoveryCode})).status,200));
+await a.req('/api/auth',{action:'logout'});
+await check('Logout invalidates session',async()=>assert.equal((await a.req('/api/data')).status,401));
+await fs.mkdir('.sites-runtime',{recursive:true});await fs.writeFile('.sites-runtime/security-results.json',JSON.stringify({date:new Date().toISOString(),environment:base,results},null,2));
+console.log(`${results.filter(r=>r.passed).length}/${results.length} passed`);if(results.some(r=>!r.passed))process.exitCode=1;
